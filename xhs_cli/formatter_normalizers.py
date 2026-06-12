@@ -60,6 +60,47 @@ def normalize_note_detail(data: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def normalize_note_hydrate(
+    data: dict[str, Any],
+    *,
+    note_id: str,
+    xsec_token: str = "",
+    xsec_source: str = "",
+) -> dict[str, Any] | None:
+    items = data.get("items", [])
+    if not items:
+        return None
+
+    entry = items[0] if isinstance(items[0], dict) else {}
+    note = entry.get("note_card", {}) if isinstance(entry.get("note_card"), dict) else {}
+    user = note.get("user", {}) if isinstance(note.get("user"), dict) else {}
+    interact = note.get("interact_info", {}) if isinstance(note.get("interact_info"), dict) else {}
+    tags = note.get("tag_list", []) if isinstance(note.get("tag_list"), list) else []
+    image_list = note.get("image_list", []) if isinstance(note.get("image_list"), list) else []
+    note_type = "video" if note.get("type") == "video" else "image"
+    actual_token = xsec_token or entry.get("xsec_token", note.get("xsec_token", ""))
+    actual_source = xsec_source or "pc_feed"
+
+    return {
+        "id": note_id,
+        "url": _build_note_url(note_id, actual_token, actual_source),
+        "title": note.get("title") or note.get("display_title") or "Untitled",
+        "body": note.get("desc", ""),
+        "author": {
+            "id": user.get("user_id", ""),
+            "name": user.get("nickname", user.get("nick_name", "Unknown")),
+        },
+        "note_type": note_type,
+        "liked_count": _coerce_int(interact.get("liked_count")),
+        "collected_count": _coerce_int(interact.get("collected_count")),
+        "comment_count": _coerce_int(interact.get("comment_count")),
+        "share_count": _coerce_int(interact.get("share_count")),
+        "tags": [tag.get("name", "") for tag in tags if isinstance(tag, dict) and tag.get("name")],
+        "image_count": len(image_list),
+        "images": _extract_note_images(image_list),
+    }
+
+
 def normalize_note_summary(item: dict[str, Any]) -> dict[str, Any] | None:
     note_card = item.get("note_card", item)
     if not isinstance(note_card, dict):
@@ -95,6 +136,58 @@ def normalize_comments(data: dict[str, Any]) -> list[dict[str, Any]]:
             "sub_comment_count": _coerce_int(comment.get("sub_comment_count", 0)),
         })
     return normalized
+
+
+def _extract_note_images(image_list: list[Any]) -> list[str]:
+    urls: list[str] = []
+    for image in image_list:
+        if not isinstance(image, dict):
+            continue
+        url = _first_non_empty(
+            image.get("url_default"),
+            image.get("url_pre"),
+            image.get("url"),
+        )
+        if not url:
+            info_list = image.get("info_list", [])
+            if isinstance(info_list, list):
+                for info in info_list:
+                    if not isinstance(info, dict):
+                        continue
+                    url = _first_non_empty(info.get("url"))
+                    if url:
+                        break
+        normalized = _normalize_media_url(url)
+        if normalized:
+            urls.append(normalized)
+    return urls
+
+
+def _first_non_empty(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _normalize_media_url(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith("//"):
+        return f"https:{text}"
+    if text.startswith("http://"):
+        return "https://" + text[len("http://"):]
+    return text
+
+
+def _build_note_url(note_id: str, xsec_token: str, xsec_source: str) -> str:
+    base = f"https://www.xiaohongshu.com/explore/{note_id}"
+    if not xsec_token:
+        return base
+    source = xsec_source or "pc_feed"
+    return f"{base}?xsec_token={xsec_token}&xsec_source={source}"
 
 
 def normalize_feed(data: dict[str, Any]) -> list[dict[str, Any]]:

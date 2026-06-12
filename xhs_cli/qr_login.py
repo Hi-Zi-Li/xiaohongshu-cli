@@ -51,6 +51,7 @@ BROWSER_EXPORT_COOKIE_NAMES = (
     "webBuild",
     "loadts",
 )
+PERSISTED_COOKIE_NAMES = BROWSER_EXPORT_COOKIE_NAMES
 
 
 class BrowserQrLoginUnavailable(XhsApiError):
@@ -78,7 +79,11 @@ def _apply_session_cookies(client: XhsClient, payload: dict[str, Any]) -> None:
         client.cookies["web_session_sec"] = str(secure_session)
 
 
-def _build_saved_cookies(a1: str, webid: str, payload: dict[str, Any]) -> dict[str, str]:
+def _build_saved_cookies(
+    fallback_a1: str,
+    fallback_webid: str,
+    payload: dict[str, Any],
+) -> dict[str, str]:
     """Build the cookie payload persisted after QR login succeeds."""
     login_info = payload.get("login_info", {})
     if not isinstance(login_info, dict):
@@ -89,15 +94,32 @@ def _build_saved_cookies(a1: str, webid: str, payload: dict[str, Any]) -> dict[s
         or login_info.get("secure_session")
         or payload.get("web_session_sec", "")
     )
-    cookies = {
-        "a1": a1,
-        "webId": webid,
-    }
+    cookies = {}
+    a1 = payload.get("a1") or fallback_a1
+    webid = payload.get("webId") or payload.get("webid") or fallback_webid
+    if a1:
+        cookies["a1"] = str(a1)
+    if webid:
+        cookies["webId"] = str(webid)
     if session:
         cookies["web_session"] = str(session)
     if secure_session:
         cookies["web_session_sec"] = str(secure_session)
+    for name in PERSISTED_COOKIE_NAMES:
+        value = payload.get(name)
+        if value:
+            cookies[name] = str(value)
     return cookies
+
+
+def _persistable_cookie_subset(cookies: dict[str, Any]) -> dict[str, str]:
+    """Filter an in-memory cookie jar down to the persisted local cookie shape."""
+    persisted: dict[str, str] = {}
+    for name in PERSISTED_COOKIE_NAMES:
+        value = cookies.get(name)
+        if value:
+            persisted[name] = str(value)
+    return persisted
 
 
 def _normalize_browser_cookies(raw_cookies: list[dict[str, Any]]) -> dict[str, str]:
@@ -154,6 +176,75 @@ def _raise_for_browser_response(response: Any) -> None:
         )
 
 
+def _qr_code_status(payload: dict[str, Any]) -> int:
+    """Read a QR status payload regardless of snake/camel case naming."""
+    raw_status = payload.get("code_status", payload.get("codeStatus", -1))
+    try:
+        return int(raw_status)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _browser_completion_ready(payload: dict[str, Any]) -> bool:
+    """Return True once the browser completion payload represents a real login."""
+    if _qr_code_status(payload) == QR_CONFIRMED:
+        return True
+
+    login_info = payload.get("login_info")
+    if isinstance(login_info, dict) and (
+        login_info.get("session")
+        or login_info.get("secure_session")
+        or login_info.get("user_id")
+        or login_info.get("userId")
+    ):
+        return True
+
+    return bool(
+        payload.get("session")
+        or payload.get("secure_session")
+        or payload.get("user_id")
+        or payload.get("userId")
+    )
+
+
+def _wait_for_confirmed_browser_completion(page: Any, *, timeout_s: int) -> dict[str, Any]:
+    """Wait until the browser QR completion endpoint reports a confirmed login."""
+    deadline = time.time() + timeout_s
+    last_payload: dict[str, Any] = {}
+
+    while True:
+        remaining_ms = max(1, int((deadline - time.time()) * 1000))
+        if remaining_ms <= 1 and time.time() >= deadline:
+            break
+
+        try:
+            response = page.wait_for_response(
+                lambda resp: QR_STATUS_ENDPOINT in resp.url and resp.request.method == "GET",
+                timeout=remaining_ms,
+            )
+        except Exception as exc:
+            raise XhsApiError(
+                "QR code login timed out while waiting for browser confirmation."
+            ) from exc
+
+        _raise_for_browser_response(response)
+        payload = _browser_response_payload(response)
+        last_payload = payload
+
+        logger.debug(
+            "Browser QR completion poll: codeStatus=%s payload=%s",
+            _qr_code_status(payload),
+            payload,
+        )
+        if _browser_completion_ready(payload):
+            return payload
+
+    raise XhsApiError(
+        "QR code login timed out before browser completion returned a confirmed session. "
+        f"last_status={_qr_code_status(last_payload)} payload={last_payload}"
+    )
+
+
 def _wait_for_browser_login_settled(page: Any) -> None:
     """Wait briefly for the browser session and post-login page state to stabilize."""
     try:
@@ -180,18 +271,65 @@ def _wait_for_browser_login_settled(page: Any) -> None:
         logger.debug("Browser-assisted QR login settled with guest=true in user/me payload: %s", payload)
 
 
+def _export_browser_context_cookies(page: Any) -> dict[str, str]:
+    """Export cookies directly from the live browser context."""
+    return _normalize_browser_cookies(page.context.cookies())
+
+
+def _validate_browser_exported_session(
+    cookies: dict[str, str],
+    *,
+    retries: int = 3,
+    wait_s: float = 1.5,
+) -> tuple[dict[str, str], str]:
+    """Validate cookies exported from Camoufox and merge response cookies."""
+    if not cookies:
+        raise XhsApiError("Browser-assisted QR login did not export any cookies.")
+
+    last_error: Exception | None = None
+    last_user_id = ""
+
+    for attempt in range(retries):
+        try:
+            with XhsClient(dict(cookies), request_delay=0) as client:
+                info = client.get_self_info()
+                merged = dict(client.cookies)
+        except NeedVerifyError:
+            return dict(cookies), ""
+        except Exception as exc:
+            last_error = exc
+        else:
+            last_user_id = _resolved_user_id(info)
+            if not bool(info.get("guest", False)):
+                return merged, last_user_id
+            last_error = XhsApiError(f"guest session after browser-assisted login: {info}")
+
+        if attempt + 1 < retries:
+            time.sleep(wait_s)
+
+    raise XhsApiError(
+        "Browser-assisted QR login exported cookies, but they did not validate "
+        f"as a logged-in session. user_id={last_user_id or 'unknown'} error={last_error}"
+    )
+
+
 def _resolved_user_id(info: dict[str, object]) -> str:
     """Extract the current user ID from activate/self payloads."""
     if not isinstance(info, dict):
         return ""
     login_info = info.get("login_info")
-    if isinstance(login_info, dict) and login_info.get("user_id"):
-        return str(login_info["user_id"])
+    if isinstance(login_info, dict):
+        if login_info.get("user_id"):
+            return str(login_info["user_id"])
+        if login_info.get("userId"):
+            return str(login_info["userId"])
     basic = info.get("basic_info", info)
     if isinstance(basic, dict) and basic.get("user_id"):
         return str(basic["user_id"])
     if info.get("user_id"):
         return str(info["user_id"])
+    if info.get("userId"):
+        return str(info["userId"])
     if info.get("userid"):
         return str(info["userid"])
     return ""
@@ -209,6 +347,8 @@ def _complete_confirmed_session(
     """Finalize QR login after confirmation until the session switches users."""
     last_data: dict[str, object] = {}
     last_self_info_user_id = ""
+    initial_session = str(client.cookies.get("web_session", "") or "")
+    initial_secure_session = str(client.cookies.get("web_session_sec", "") or "")
     for attempt in range(retries):
         completion_data = client.complete_qr_login(qr_id, code)
         _apply_session_cookies(client, completion_data)
@@ -226,20 +366,31 @@ def _complete_confirmed_session(
             )
         logger.debug(
             "QR post-confirm completion attempt=%d confirmed_user_id=%s "
-            "completion_user_id=%s self_info_user_id=%s cookies=%s data=%s",
+            "completion_user_id=%s self_info_user_id=%s session_changed=%s cookies=%s data=%s",
             attempt + 1,
             confirmed_user_id,
             completed_user_id,
             self_info_user_id,
+            (
+                client.cookies.get("web_session") != initial_session
+                or client.cookies.get("web_session_sec") != initial_secure_session
+            ),
             {
+                "a1": client.cookies.get("a1"),
+                "webId": client.cookies.get("webId"),
                 "web_session": client.cookies.get("web_session"),
                 "web_session_sec": client.cookies.get("web_session_sec"),
+                "id_token": client.cookies.get("id_token"),
             },
             completion_data,
         )
-        if completed_user_id and completed_user_id == confirmed_user_id:
+        session_changed = (
+            str(client.cookies.get("web_session", "") or "") != initial_session
+            or str(client.cookies.get("web_session_sec", "") or "") != initial_secure_session
+        )
+        if session_changed and completed_user_id and completed_user_id == confirmed_user_id:
             return completion_data
-        if self_info_user_id and self_info_user_id == confirmed_user_id:
+        if session_changed and self_info_user_id and self_info_user_id == confirmed_user_id:
             return completion_data
         if attempt + 1 < retries:
             time.sleep(wait_s)
@@ -352,7 +503,7 @@ def _browser_assisted_qrcode_login(
             "Camoufox sync API is unavailable in the current environment."
         ) from exc
 
-    state = {"last_status": -1}
+    state: dict[str, Any] = {"last_status": -1, "completion_data": {}}
 
     _emit_status(on_status, "🔑 Starting browser-assisted QR login...")
 
@@ -361,13 +512,20 @@ def _browser_assisted_qrcode_login(
 
         def _handle_response(response) -> None:
             url = response.url
-            if QR_USERINFO_ENDPOINT not in url:
+            if (
+                QR_USERINFO_ENDPOINT not in url
+                and QR_STATUS_ENDPOINT not in url
+                and "/api/sns/web/v2/user/me" not in url
+            ):
                 return
             try:
                 payload = _unwrap_browser_response_payload(response.json())
             except Exception as exc:
                 logger.debug("Failed to parse browser QR poll response: %s", exc)
                 return
+
+            if QR_STATUS_ENDPOINT in url and isinstance(payload, dict):
+                state["completion_data"] = payload
 
             code_status = int(payload.get("codeStatus", -1))
             if code_status == state["last_status"]:
@@ -401,46 +559,59 @@ def _browser_assisted_qrcode_login(
             _emit_status(on_status, f"QR URL: {qr_url}")
         _emit_status(on_status, "\n⏳ Waiting for QR code scan...")
 
-        try:
-            with page.expect_response(
-                lambda response: QR_STATUS_ENDPOINT in response.url and response.request.method == "GET",
-                timeout=timeout_s * 1000,
-            ) as completion_info:
-                pass
-        except Exception as exc:
-            raise XhsApiError("QR code login timed out while waiting for browser completion.") from exc
+        deadline = time.time() + timeout_s
+        last_validation_error: Exception | None = None
+        settled_after_confirm = False
 
-        _raise_for_browser_response(completion_info.value)
-        completion_data = _browser_response_payload(completion_info.value)
-        login_info = completion_data.get("login_info", {})
-        if not isinstance(login_info, dict):
-            login_info = {}
+        while time.time() < deadline:
+            if page.is_closed():
+                raise XhsApiError("Browser-assisted QR login browser window was closed before login completed.")
 
-        _wait_for_browser_login_settled(page)
+            if state["last_status"] == QR_CONFIRMED and not settled_after_confirm:
+                _wait_for_browser_login_settled(page)
+                settled_after_confirm = True
 
-        cookies = _normalize_browser_cookies(page.context.cookies())
-        session = login_info.get("session")
-        secure_session = login_info.get("secure_session")
-        if isinstance(session, str) and session:
-            cookies["web_session"] = session
-        if isinstance(secure_session, str) and secure_session:
-            cookies["web_session_sec"] = secure_session
+            completion_data = state.get("completion_data", {})
+            if not isinstance(completion_data, dict):
+                completion_data = {}
+            login_info = completion_data.get("login_info", {})
+            if not isinstance(login_info, dict):
+                login_info = {}
 
-        required = ("a1", "webId", "web_session")
-        missing = [name for name in required if not cookies.get(name)]
-        if missing:
-            raise XhsApiError(
-                "Browser-assisted QR login succeeded, but exported cookies were incomplete: "
-                f"missing={', '.join(missing)} completion_data={completion_data}"
-            )
+            cookies = _export_browser_context_cookies(page)
+            session = login_info.get("session")
+            secure_session = login_info.get("secure_session")
+            if isinstance(session, str) and session:
+                cookies["web_session"] = session
+            if isinstance(secure_session, str) and secure_session:
+                cookies["web_session_sec"] = secure_session
 
-        save_cookies(cookies)
+            if cookies.get("a1") and cookies.get("webId"):
+                try:
+                    validated_cookies, user_id = _validate_browser_exported_session(
+                        cookies,
+                        retries=1,
+                        wait_s=0,
+                    )
+                except Exception as exc:
+                    last_validation_error = exc
+                    logger.debug("Browser cookie validation not ready yet: %s", exc)
+                else:
+                    save_cookies(validated_cookies)
+                    if user_id:
+                        _emit_status(on_status, f"👤 User ID: {user_id}")
+                    else:
+                        _emit_status(on_status, "Browser cookies exported and saved.")
+                    return validated_cookies
 
-        user_id = str(login_info.get("user_id", "")).strip() or _resolved_user_id(completion_data)
-        if user_id:
-            _emit_status(on_status, f"👤 User ID: {user_id}")
+            time.sleep(0.8 if state["last_status"] == QR_CONFIRMED else 1.5)
 
-        return cookies
+        raise XhsApiError(
+            "Browser-assisted QR login timed out before exported browser cookies became a valid session. "
+            f"last_status={state.get('last_status', -1)} "
+            f"completion_data={state.get('completion_data', {})} "
+            f"last_validation_error={last_validation_error}"
+        )
 
 
 def _http_qrcode_login(
@@ -520,7 +691,11 @@ def _http_qrcode_login(
                     confirmed_user_id,
                 )
                 user_id = _resolved_user_id(completion_data) or confirmed_user_id
-                cookies = _build_saved_cookies(a1, webid, client.cookies)
+                cookies = _persistable_cookie_subset(client.cookies)
+                cookies = {
+                    **_build_saved_cookies(a1, webid, completion_data),
+                    **cookies,
+                }
                 save_cookies(cookies)
                 _emit_status(on_status, f"👤 User ID: {user_id}")
                 return cookies

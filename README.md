@@ -37,6 +37,8 @@ A CLI for Xiaohongshu (小红书) — search, read, interact, and post via rever
 ```bash
 # Recommended: uv tool (fast, isolated)
 uv tool install xiaohongshu-cli
+# Optional browser-assisted QR backend:
+uv tool install 'xiaohongshu-cli[browser]'
 
 # Or: pipx
 pipx install xiaohongshu-cli
@@ -64,7 +66,8 @@ uv sync
 ```bash
 # ─── Auth ─────────────────────────────────────────
 xhs login                             # Extract cookies from browser
-xhs login --qrcode                    # Browser-assisted QR login, scan in terminal
+xhs login --qrcode                    # QR login via HTTP flow, scan in terminal
+xhs login --qrcode --browser-assisted # Optional browser-assisted QR login
 xhs status                            # Check login status
 xhs whoami                            # Detailed profile (fans, likes, etc)
 xhs whoami --json                     # Structured JSON envelope
@@ -150,10 +153,12 @@ xiaohongshu-cli supports multiple authentication methods:
 
 1. **Saved cookies** — loads from `~/.xiaohongshu-cli/cookies.json`
 2. **Browser cookies** — auto-detects installed browsers and extracts cookies (supports Chrome, Arc, Edge, Firefox, Safari, Brave, Chromium, Opera, Vivaldi, and more)
-3. **QR code login** — browser-assisted login with terminal QR output (`xhs login --qrcode`)
+3. **QR code login** — HTTP QR login with terminal QR output (`xhs login --qrcode`)
+4. **Browser-assisted QR login** — optional backend (`xhs login --qrcode --browser-assisted`)
 
 `xhs login` automatically tries all installed browsers and uses the first one with valid cookies.
-Use `--cookie-source <browser>` to specify a browser explicitly, or `--qrcode` for browser-assisted QR login.
+Use `--cookie-source <browser>` to specify a browser explicitly, or `--qrcode` for the default HTTP QR flow.
+If you specifically need the browser-assisted backend, install the `browser` extra and add `--browser-assisted`.
 Other authenticated commands automatically retry once with fresh browser cookies when the saved session has expired.
 
 ### Cookie TTL
@@ -360,7 +365,8 @@ uv sync
 ```bash
 # 认证
 xhs login                             # 从浏览器提取 Cookie
-xhs login --qrcode                    # browser-assisted 二维码扫码登录（终端显示二维码）
+xhs login --qrcode                    # HTTP 二维码扫码登录（终端显示二维码）
+xhs login --qrcode --browser-assisted # 可选 browser-assisted 二维码扫码登录
 xhs status                            # 检查登录状态
 xhs whoami                            # 查看用户资料
 xhs logout                            # 清除缓存的 Cookie
@@ -432,11 +438,12 @@ xiaohongshu-cli 支持多种认证方式：
 
 1. **已保存 Cookie** — 从 `~/.xiaohongshu-cli/cookies.json` 加载
 2. **浏览器 Cookie** — 自动检测已安装浏览器并提取（支持 Chrome、Arc、Edge、Firefox、Safari、Brave、Chromium、Opera、Vivaldi 等）
-3. **二维码扫码登录** — browser-assisted 登录，终端显示二维码，用小红书 App 扫码（`xhs login --qrcode`）
+3. **二维码扫码登录** — 默认 HTTP 登录，终端显示二维码，用小红书 App 扫码（`xhs login --qrcode`）
+4. **可选 browser-assisted 二维码登录** — 需安装 browser extra，再执行 `xhs login --qrcode --browser-assisted`
 
 Cookie 保存后有效期 **7 天**，超时后自动尝试从浏览器刷新。
 
-`xhs login` 会自动尝试所有已安装浏览器，使用第一个有有效 Cookie 的浏览器。也可用 `--cookie-source <browser>` 指定浏览器，或 `--qrcode` 使用 browser-assisted 二维码登录。其他需认证命令在 session 过期时会自动重试一次。
+`xhs login` 会自动尝试所有已安装浏览器，使用第一个有有效 Cookie 的浏览器。也可用 `--cookie-source <browser>` 指定浏览器，或 `--qrcode` 使用默认 HTTP 二维码登录。若要启用 browser-assisted 后端，需安装 browser extra 并追加 `--browser-assisted`。其他需认证命令在 session 过期时会自动重试一次。
 
 ## 常见问题
 

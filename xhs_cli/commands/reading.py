@@ -4,6 +4,7 @@ import click
 
 from ..command_normalizers import normalize_paged_notes
 from ..cookies import cache_note_context
+from ..formatter_normalizers import normalize_comments, normalize_note_hydrate
 from ..formatter import (
     maybe_print_structured,
     print_info,
@@ -145,6 +146,69 @@ def comments(ctx, id_or_url: str, cursor: str, xsec_token: str, fetch_all: bool,
             _render_comments(data)
     except Exception as exc:
         exit_for_error(exc, as_json=as_json, as_yaml=as_yaml)
+
+
+@click.command()
+@click.argument("id_or_url")
+@click.option("--xsec-token", default="", help="Security token (or reuse a cached token for this note)")
+@click.option("-c", "--comment-limit", default=5, show_default=True, help="Maximum comments to include")
+@structured_output_options
+@click.pass_context
+def hydrate(ctx, id_or_url: str, xsec_token: str, comment_limit: int, as_json: bool, as_yaml: bool):
+    """Fetch machine-readable note detail for downstream hydration."""
+    note_id, token, url_source = resolve_note_reference(id_or_url, xsec_token=xsec_token)
+    xsec_source = url_source or "pc_feed"
+    if token:
+        cache_note_context(note_id, token, xsec_source)
+
+    def _hydrate_action(client):
+        kwargs = {"xsec_token": token}
+        if url_source:
+            kwargs["xsec_source"] = url_source
+
+        detail = client.get_note_detail(note_id, **kwargs)
+        note = normalize_note_hydrate(
+            detail,
+            note_id=note_id,
+            xsec_token=token,
+            xsec_source=xsec_source,
+        )
+        if note is None:
+            raise ValueError(f"Note {note_id} not found")
+
+        comments = []
+        warnings = []
+        if comment_limit > 0:
+            try:
+                comment_data = client.get_comments(note_id, **kwargs)
+                comments = normalize_comments(comment_data)[:comment_limit]
+            except Exception as exc:  # pragma: no cover - exercised via CLI behavior
+                warnings.append({
+                    "code": "comments_unavailable",
+                    "message": str(exc),
+                })
+
+        return {
+            "mode": "hydrate",
+            "note": note,
+            "comments": comments,
+            "warnings": warnings,
+        }
+
+    def _render_hydrate(data):
+        note = data.get("note", {})
+        print_info(
+            f"Hydrated {note.get('id', '')}: "
+            f"{len(data.get('comments', []))} comments"
+        )
+
+    handle_command(
+        ctx,
+        action=_hydrate_action,
+        render=_render_hydrate,
+        as_json=as_json,
+        as_yaml=as_yaml,
+    )
 
 
 @click.command()

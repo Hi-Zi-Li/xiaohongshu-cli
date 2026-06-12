@@ -15,7 +15,7 @@ tags:
 # xiaohongshu-cli — Xiaohongshu CLI Tool
 
 **Binary:** `xhs`
-**Credentials:** browser cookies (auto-extracted) or browser-assisted QR login (`--qrcode`)
+**Credentials:** browser cookies (auto-extracted) or QR login (`--qrcode`)
 
 ## Setup
 
@@ -40,7 +40,7 @@ xhs status --yaml >/dev/null && echo "AUTH_OK" || echo "AUTH_NEEDED"
 ```
 
 If `AUTH_OK`, skip to [Command Reference](#command-reference).
-If `AUTH_NEEDED`, proceed to Step 1. Prefer `--qrcode` when browser cookie extraction is unavailable but launching a browser is acceptable.
+If `AUTH_NEEDED`, proceed to Step 1. Prefer `--qrcode` when browser cookie extraction is unavailable.
 
 ### Step 1: Guide user to authenticate
 
@@ -49,7 +49,8 @@ Ensure user is logged into xiaohongshu.com in any browser supported by [browser_
 ```bash
 xhs login                              # auto-detect browser with valid cookies
 xhs login --cookie-source arc          # specify browser explicitly
-xhs login --qrcode                     # browser-assisted QR login with terminal QR output
+xhs login --qrcode                     # default HTTP QR login with terminal QR output
+xhs login --qrcode --browser-assisted  # optional browser-assisted QR login
 ```
 
 Verify with:
@@ -131,7 +132,8 @@ Payloads live under `.data`.
 | Command | Description |
 |---------|-------------|
 | `xhs login` | Extract cookies from browser (auto-detect) |
-| `xhs login --qrcode` | Browser-assisted QR login — terminal QR output, browser completes login |
+| `xhs login --qrcode` | Default HTTP QR login — terminal QR output |
+| `xhs login --qrcode --browser-assisted` | Optional browser-assisted QR login |
 | `xhs status` | Check authentication status |
 | `xhs logout` | Clear cached cookies |
 | `xhs whoami` | Show current user profile |
@@ -199,7 +201,13 @@ xhs hot -c travel --yaml
 ```bash
 # When browser cookie extraction is not available
 xhs login --qrcode
-# → Launches a browser-assisted login flow
+# → Uses the default HTTP QR login flow
+# → Renders QR in terminal using Unicode half-blocks
+# → Scan with Xiaohongshu app → confirm → export cookies
+
+# Optional browser-assisted backend
+xhs login --qrcode --browser-assisted
+# → Requires the optional browser backend dependencies
 # → Renders QR in terminal using Unicode half-blocks
 # → Scan with Xiaohongshu app → confirm → export cookies
 ```
